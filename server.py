@@ -86,7 +86,7 @@ def fetch_ohlcv_pykrx(ticker, months=36):
         start.strftime("%Y%m%d"),
         end.strftime("%Y%m%d"),
         ticker,
-        freq="M"
+        freq="m"
     )
     if df is None or len(df) == 0:
         raise ValueError("데이터 없음: " + ticker)
