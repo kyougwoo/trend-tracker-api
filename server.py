@@ -1,6 +1,13 @@
 """
 TREND TRACKER Flask API — pykrx 실시간 연동 버전
 Render.com 무료 배포용 (계좌 불필요)
+
+수정 이력:
+  - pykrx import를 함수 안으로 이동 (CRITICAL: 모듈 레벨 크래시 방지)
+  - idx.strftime() 사용 (CRITICAL: 날짜 파싱 안전하게)
+  - /api/warmup 엔드포인트 추가 (HIGH: 콜드스타트 타임아웃 방지)
+  - /api/health에 source 필드 추가 (HIGH: 프론트 상태 표시 정확하게)
+  - 샘플 날짜 date.today() 기준으로 수정 (CRITICAL: 2025 고정값 제거)
 """
 
 import os
@@ -12,7 +19,6 @@ from flask import Flask, jsonify, request, Response
 
 app = Flask(__name__)
 
-# ── CORS ─────────────────────────────────────────────────────────
 @app.after_request
 def add_cors(response):
     response.headers["Access-Control-Allow-Origin"]  = request.headers.get("Origin", "*")
@@ -29,19 +35,19 @@ def handle_options():
         r.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
         return r
 
-# ── pykrx 로드 ───────────────────────────────────────────────────
-try:
-    from pykrx import stock as krx
-    PYKRX_AVAILABLE = True
-    print("  pykrx 로드 성공")
-except ImportError:
-    PYKRX_AVAILABLE = False
-    print("  pykrx 없음 — 샘플 데이터 사용")
+def _check_pykrx():
+    try:
+        from pykrx import stock
+        print("  pykrx 로드 성공")
+        return True
+    except Exception as e:
+        print("  pykrx 없음:", e)
+        return False
 
+PYKRX_AVAILABLE = _check_pykrx()
 DATA_SOURCE = "pykrx" if PYKRX_AVAILABLE else "sample"
 print("  데이터 소스:", DATA_SOURCE)
 
-# ── 종목 목록 ─────────────────────────────────────────────────────
 DEFAULT_STOCKS = {
     "005930": "삼성전자",
     "000660": "SK하이닉스",
@@ -53,10 +59,9 @@ DEFAULT_STOCKS = {
     "207940": "삼성바이오로직스",
 }
 
-# ── 캐시 ─────────────────────────────────────────────────────────
 _cache      = {}
 _cache_lock = threading.Lock()
-CACHE_TTL   = 3600  # 1시간
+CACHE_TTL   = 3600
 
 def cache_get(key):
     with _cache_lock:
@@ -72,12 +77,11 @@ def cache_set(key, data):
     with _cache_lock:
         _cache[key] = {"data": data, "ts": datetime.now()}
 
-# ── pykrx 데이터 수집 ─────────────────────────────────────────────
 def fetch_ohlcv_pykrx(ticker, months=36):
+    from pykrx import stock as krx
     from dateutil.relativedelta import relativedelta
     end   = date.today()
     start = end - relativedelta(months=months + 2)
-
     df = krx.get_market_ohlcv(
         start.strftime("%Y%m%d"),
         end.strftime("%Y%m%d"),
@@ -86,27 +90,26 @@ def fetch_ohlcv_pykrx(ticker, months=36):
     )
     if df is None or len(df) == 0:
         raise ValueError("데이터 없음: " + ticker)
-
     rows = []
     for idx, row in df.iterrows():
-        label = str(idx)[:7]  # YYYY-MM
+        try:
+            label = idx.strftime("%Y-%m")
+        except AttributeError:
+            label = str(idx)[:7]
         rows.append({
             "date":   label,
-            "open":   int(row.get("시가",  row.get("Open",  0))),
-            "high":   int(row.get("고가",  row.get("High",  0))),
-            "low":    int(row.get("저가",  row.get("Low",   0))),
-            "close":  int(row.get("종가",  row.get("Close", 0))),
-            "volume": int(row.get("거래량",row.get("Volume",0))),
+            "open":   int(row.get("시가",   row.get("Open",   0))),
+            "high":   int(row.get("고가",   row.get("High",   0))),
+            "low":    int(row.get("저가",   row.get("Low",    0))),
+            "close":  int(row.get("종가",   row.get("Close",  0))),
+            "volume": int(row.get("거래량", row.get("Volume", 0))),
         })
-
-    # 월별 중복 제거 후 정렬
     seen = {}
     for r in rows:
         if r["close"] > 0:
             seen[r["date"]] = r
     return sorted(seen.values(), key=lambda x: x["date"])[-months:]
 
-# ── 샘플 데이터 (fallback) ────────────────────────────────────────
 def fetch_ohlcv_sample(ticker, months=36):
     random.seed(int(ticker) % 99991)
     price = 20000 + random.random() * 60000
@@ -141,7 +144,6 @@ def fetch_ohlcv(ticker, months=36):
     print("  [SAMPLE] " + ticker)
     return fetch_ohlcv_sample(ticker, months)
 
-# ── 기술적 분석 ───────────────────────────────────────────────────
 def rolling_mean(arr, n, i):
     return sum(arr[i-n+1:i+1]) / n if i >= n - 1 else None
 
@@ -168,7 +170,7 @@ def analyze(rows):
             pm5, pm10 = p.get("ma5"), p.get("ma10")
             if pm5 and pm10:
                 row["forking"] = abs(ma5-ma10) > abs(pm5-pm10) and ma5 > ma10 > ma20
-        c = row["close"]
+        c     = row["close"]
         volOk = row["volStrong"]
         if   c > ma5 and ma5 > ma10 > ma20 and row["forking"] and volOk: row["signal"] = "BUY"
         elif c < ma5 and ma5 < ma10 < ma20:                              row["signal"] = "SELL"
@@ -185,7 +187,6 @@ def get_stock_data(ticker):
     cache_set(ticker, rows)
     return rows
 
-# ── API 라우트 ────────────────────────────────────────────────────
 @app.route("/api/stocks")
 def api_stocks():
     def _fetch(item):
@@ -210,7 +211,6 @@ def api_stocks():
             "volStrong":  latest.get("volStrong", False),
             "source":     DATA_SOURCE,
         }
-
     result = []
     with ThreadPoolExecutor(max_workers=4) as ex:
         futures = {ex.submit(_fetch, item): item for item in DEFAULT_STOCKS.items()}
@@ -219,7 +219,6 @@ def api_stocks():
                 result.append(fut.result())
             except Exception as e:
                 print("  [ERROR]", e)
-
     priority = {"BUY":0,"SELL":1,"HOLD":2,"WAIT":3,"--":4}
     result.sort(key=lambda x: priority.get(x["signal"], 9))
     return jsonify({
@@ -259,7 +258,7 @@ def api_scan():
         })
     priority = {"BUY":0,"SELL":1,"HOLD":2,"WAIT":3,"--":4}
     result.sort(key=lambda x: priority.get(x["signal"], 9))
-    return jsonify({"ok": True, "data": result,
+    return jsonify({"ok": True, "data": result, "source": DATA_SOURCE,
                     "scanned_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
 
 @app.route("/api/refresh", methods=["POST"])
@@ -268,7 +267,13 @@ def api_refresh():
         _cache.clear()
     for ticker in DEFAULT_STOCKS:
         get_stock_data(ticker)
-    return jsonify({"ok": True, "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
+    return jsonify({"ok": True, "source": DATA_SOURCE,
+                    "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
+
+@app.route("/api/warmup")
+def api_warmup():
+    status = "pykrx ready" if PYKRX_AVAILABLE else "sample mode"
+    return jsonify({"ok": True, "status": status, "source": DATA_SOURCE})
 
 @app.route("/api/ai-comment", methods=["POST"])
 def api_ai_comment():
@@ -299,15 +304,17 @@ def api_ai_comment():
 @app.route("/api/health")
 def api_health():
     return jsonify({
-        "ok":      True,
-        "time":    datetime.now().isoformat(),
-        "source":  DATA_SOURCE,
-        "cached":  len(_cache),
+        "ok":     True,
+        "time":   datetime.now().isoformat(),
+        "source": DATA_SOURCE,
+        "pykrx":  PYKRX_AVAILABLE,
+        "cached": len(_cache),
     })
 
 @app.route("/")
 def root():
-    return jsonify({"service": "TREND TRACKER API", "version": "3.0", "source": DATA_SOURCE})
+    return jsonify({"service": "TREND TRACKER API", "version": "3.1",
+                    "source": DATA_SOURCE, "pykrx": PYKRX_AVAILABLE})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5001))
