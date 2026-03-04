@@ -1,16 +1,6 @@
 """
-TREND TRACKER Flask API — 한국투자증권 실시간 연동
-Render.com 무료 배포용
-
-환경변수 (Render 대시보드):
-  KIS_APP_KEY     한국투자증권 앱키
-  KIS_APP_SECRET  한국투자증권 앱시크릿
-  KIS_IS_PAPER    모의투자 여부 (true/false, 기본 false)
-
-수정 이력:
-  - cache_get: .seconds → .total_seconds() (CRITICAL: TTL 오동작 수정)
-  - api_stocks: KIS 실시간 호출 concurrent.futures로 병렬화 (타임아웃 방지)
-  - /api/ai-comment 엔드포인트 추가 (CRITICAL: 브라우저 CORS 우회)
+TREND TRACKER Flask API — pykrx 실시간 연동 버전
+Render.com 무료 배포용 (계좌 불필요)
 """
 
 import os
@@ -39,17 +29,16 @@ def handle_options():
         r.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
         return r
 
-# ── KIS 클라이언트 ────────────────────────────────────────────────
+# ── pykrx 로드 ───────────────────────────────────────────────────
 try:
-    from kis_client import get_monthly_ohlcv, get_current_price
-    KIS_AVAILABLE = bool(
-        os.environ.get("KIS_APP_KEY") and
-        os.environ.get("KIS_APP_SECRET")
-    )
+    from pykrx import stock as krx
+    PYKRX_AVAILABLE = True
+    print("  pykrx 로드 성공")
 except ImportError:
-    KIS_AVAILABLE = False
+    PYKRX_AVAILABLE = False
+    print("  pykrx 없음 — 샘플 데이터 사용")
 
-DATA_SOURCE = "kis" if KIS_AVAILABLE else "sample"
+DATA_SOURCE = "pykrx" if PYKRX_AVAILABLE else "sample"
 print("  데이터 소스:", DATA_SOURCE)
 
 # ── 종목 목록 ─────────────────────────────────────────────────────
@@ -67,37 +56,65 @@ DEFAULT_STOCKS = {
 # ── 캐시 ─────────────────────────────────────────────────────────
 _cache      = {}
 _cache_lock = threading.Lock()
-CACHE_TTL   = 3600
-
+CACHE_TTL   = 3600  # 1시간
 
 def cache_get(key):
     with _cache_lock:
         item = _cache.get(key)
         if not item:
             return None
-        # FIX: .seconds → .total_seconds()
-        # timedelta.seconds는 days 부분을 무시해 TTL이 비정상 동작
-        elapsed = (datetime.now() - item["ts"]).total_seconds()
-        if elapsed > CACHE_TTL:
+        if (datetime.now() - item["ts"]).total_seconds() > CACHE_TTL:
             del _cache[key]
             return None
         return item["data"]
-
 
 def cache_set(key, data):
     with _cache_lock:
         _cache[key] = {"data": data, "ts": datetime.now()}
 
+# ── pykrx 데이터 수집 ─────────────────────────────────────────────
+def fetch_ohlcv_pykrx(ticker, months=36):
+    from dateutil.relativedelta import relativedelta
+    end   = date.today()
+    start = end - relativedelta(months=months + 2)
+
+    df = krx.get_market_ohlcv(
+        start.strftime("%Y%m%d"),
+        end.strftime("%Y%m%d"),
+        ticker,
+        freq="M"
+    )
+    if df is None or len(df) == 0:
+        raise ValueError("데이터 없음: " + ticker)
+
+    rows = []
+    for idx, row in df.iterrows():
+        label = str(idx)[:7]  # YYYY-MM
+        rows.append({
+            "date":   label,
+            "open":   int(row.get("시가",  row.get("Open",  0))),
+            "high":   int(row.get("고가",  row.get("High",  0))),
+            "low":    int(row.get("저가",  row.get("Low",   0))),
+            "close":  int(row.get("종가",  row.get("Close", 0))),
+            "volume": int(row.get("거래량",row.get("Volume",0))),
+        })
+
+    # 월별 중복 제거 후 정렬
+    seen = {}
+    for r in rows:
+        if r["close"] > 0:
+            seen[r["date"]] = r
+    return sorted(seen.values(), key=lambda x: x["date"])[-months:]
 
 # ── 샘플 데이터 (fallback) ────────────────────────────────────────
-def _sample_ohlcv(ticker, months=36):
+def fetch_ohlcv_sample(ticker, months=36):
     random.seed(int(ticker) % 99991)
     price = 20000 + random.random() * 60000
     today = date.today()
     rows  = []
     for i in range(months, 0, -1):
-        yr  = today.year  + (today.month - i - 1) // 12
-        mo  = (today.month - i - 1) % 12 + 1
+        yr = today.year  + (today.month - i - 1) // 12
+        mo = (today.month - i - 1) % 12 + 1
         lbl = "%d-%02d" % (yr, mo)
         ret = 0.007 + (random.random() - 0.5) * 0.10
         o   = round(price * (1 + (random.random()-0.5)*0.02) / 100) * 100
@@ -113,30 +130,29 @@ def _sample_ohlcv(ticker, months=36):
         price = max(c, 100)
     return rows
 
-
-# ── 데이터 수집 ───────────────────────────────────────────────────
 def fetch_ohlcv(ticker, months=36):
-    if KIS_AVAILABLE:
+    if PYKRX_AVAILABLE:
         try:
-            rows = get_monthly_ohlcv(ticker, months)
-            print("  [KIS] %s — %d rows" % (ticker, len(rows)))
+            rows = fetch_ohlcv_pykrx(ticker, months)
+            print("  [pykrx] %s — %d rows" % (ticker, len(rows)))
             return rows
         except Exception as e:
-            print("  [KIS ERROR] %s: %s" % (ticker, str(e)[:80]))
-    return _sample_ohlcv(ticker, months)
-
+            print("  [pykrx ERROR] %s: %s" % (ticker, str(e)[:80]))
+    print("  [SAMPLE] " + ticker)
+    return fetch_ohlcv_sample(ticker, months)
 
 # ── 기술적 분석 ───────────────────────────────────────────────────
 def rolling_mean(arr, n, i):
     return sum(arr[i-n+1:i+1]) / n if i >= n - 1 else None
 
-
 def analyze(rows):
     closes = [r["close"] for r in rows]
+    avgvol = sum(r["volume"] for r in rows) / max(len(rows), 1)
     for i, row in enumerate(rows):
         row["ma5"]  = round(rolling_mean(closes, 5,  i)) if i >= 4  else None
         row["ma10"] = round(rolling_mean(closes, 10, i)) if i >= 9  else None
         row["ma20"] = round(rolling_mean(closes, 20, i)) if i >= 19 else None
+        row["volStrong"] = row["volume"] > avgvol * 1.2
         ma5, ma10, ma20 = row["ma5"], row["ma10"], row["ma20"]
         if not (ma5 and ma10 and ma20):
             row["alignment"] = "--"
@@ -153,12 +169,12 @@ def analyze(rows):
             if pm5 and pm10:
                 row["forking"] = abs(ma5-ma10) > abs(pm5-pm10) and ma5 > ma10 > ma20
         c = row["close"]
-        if   c > ma5 and ma5 > ma10 > ma20 and row["forking"]: row["signal"] = "BUY"
-        elif c < ma5 and ma5 < ma10 < ma20:                    row["signal"] = "SELL"
-        elif ma5 > ma10 > ma20:                                 row["signal"] = "HOLD"
-        else:                                                   row["signal"] = "WAIT"
+        volOk = row["volStrong"]
+        if   c > ma5 and ma5 > ma10 > ma20 and row["forking"] and volOk: row["signal"] = "BUY"
+        elif c < ma5 and ma5 < ma10 < ma20:                              row["signal"] = "SELL"
+        elif ma5 > ma10 > ma20:                                           row["signal"] = "HOLD"
+        else:                                                             row["signal"] = "WAIT"
     return rows
-
 
 def get_stock_data(ticker):
     cached = cache_get(ticker)
@@ -169,52 +185,40 @@ def get_stock_data(ticker):
     cache_set(ticker, rows)
     return rows
 
-
 # ── API 라우트 ────────────────────────────────────────────────────
 @app.route("/api/stocks")
 def api_stocks():
-    # FIX: ThreadPoolExecutor로 KIS 호출 병렬화 — 순차 호출 시 타임아웃 위험
-    def _fetch_one(ticker_name):
-        ticker, name = ticker_name
+    def _fetch(item):
+        ticker, name = item
         rows   = get_stock_data(ticker)
         latest = rows[-1]
         prev   = rows[-2] if len(rows) >= 2 else latest
-        row = {
+        return {
             "ticker":     ticker,
             "name":       name,
             "date":       latest["date"],
             "close":      latest["close"],
             "prev":       prev["close"],
             "change":     latest["close"] - prev["close"],
-            "change_pct": round((latest["close"]-prev["close"]) / max(prev["close"], 1) * 100, 2),
+            "change_pct": round((latest["close"]-prev["close"]) / max(prev["close"],1) * 100, 2),
             "ma5":        latest["ma5"],
             "ma10":       latest["ma10"],
             "ma20":       latest["ma20"],
             "alignment":  latest["alignment"],
             "forking":    latest["forking"],
             "signal":     latest["signal"],
+            "volStrong":  latest.get("volStrong", False),
             "source":     DATA_SOURCE,
         }
-        # 실시간 현재가 (KIS 연결 시)
-        if KIS_AVAILABLE:
-            try:
-                rt = get_current_price(ticker)
-                row["realtime_price"]      = rt["close"]
-                row["realtime_change"]     = rt["change"]
-                row["realtime_change_pct"] = rt["change_pct"]
-            except Exception:
-                pass
-        return row
 
     result = []
     with ThreadPoolExecutor(max_workers=4) as ex:
-        futures = {ex.submit(_fetch_one, item): item for item in DEFAULT_STOCKS.items()}
+        futures = {ex.submit(_fetch, item): item for item in DEFAULT_STOCKS.items()}
         for fut in as_completed(futures):
             try:
                 result.append(fut.result())
             except Exception as e:
-                ticker = futures[fut][0]
-                print("  [ERROR] %s: %s" % (ticker, e))
+                print("  [ERROR]", e)
 
     priority = {"BUY":0,"SELL":1,"HOLD":2,"WAIT":3,"--":4}
     result.sort(key=lambda x: priority.get(x["signal"], 9))
@@ -225,38 +229,18 @@ def api_stocks():
         "source":  DATA_SOURCE,
     })
 
-
 @app.route("/api/stock/<ticker>")
 def api_stock(ticker):
     if ticker not in DEFAULT_STOCKS:
         return jsonify({"ok": False, "error": "종목 없음"}), 404
-    rows     = get_stock_data(ticker)
-    realtime = {}
-    if KIS_AVAILABLE:
-        try:
-            realtime = get_current_price(ticker)
-        except Exception:
-            pass
+    rows = get_stock_data(ticker)
     return jsonify({
-        "ok":       True,
-        "ticker":   ticker,
-        "name":     DEFAULT_STOCKS[ticker],
-        "data":     rows,
-        "realtime": realtime,
-        "source":   DATA_SOURCE,
+        "ok":     True,
+        "ticker": ticker,
+        "name":   DEFAULT_STOCKS[ticker],
+        "data":   rows,
+        "source": DATA_SOURCE,
     })
-
-
-@app.route("/api/quote/<ticker>")
-def api_quote(ticker):
-    if not KIS_AVAILABLE:
-        return jsonify({"ok": False, "error": "KIS API 미연결"}), 503
-    try:
-        rt = get_current_price(ticker)
-        return jsonify({"ok": True, "ticker": ticker, **rt})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
 
 @app.route("/api/scan")
 def api_scan():
@@ -278,46 +262,6 @@ def api_scan():
     return jsonify({"ok": True, "data": result,
                     "scanned_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
 
-
-@app.route("/api/ai-comment", methods=["POST"])
-def api_ai_comment():
-    """
-    FIX: AI 분석을 서버에서 프록시 처리
-    브라우저에서 Anthropic API 직접 호출 시 CORS 오류 → 서버 프록시로 해결
-    """
-    import requests as req
-
-    body = request.get_json(silent=True) or {}
-    prompt = body.get("prompt", "")
-    if not prompt:
-        return jsonify({"ok": False, "error": "prompt 필드 필요"}), 400
-
-    anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not anthropic_key:
-        return jsonify({"ok": False, "error": "ANTHROPIC_API_KEY 환경변수 없음"}), 503
-
-    try:
-        res = req.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "Content-Type":            "application/json",
-                "x-api-key":               anthropic_key,
-                "anthropic-version":       "2023-06-01",
-            },
-            json={
-                "model":      "claude-sonnet-4-20250514",
-                "max_tokens": 800,
-                "messages":   [{"role": "user", "content": prompt}],
-            },
-            timeout=30,
-        )
-        data = res.json()
-        text = data.get("content", [{}])[0].get("text", "분석 결과 없음")
-        return jsonify({"ok": True, "text": text})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
 @app.route("/api/refresh", methods=["POST"])
 def api_refresh():
     with _cache_lock:
@@ -326,28 +270,49 @@ def api_refresh():
         get_stock_data(ticker)
     return jsonify({"ok": True, "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
 
+@app.route("/api/ai-comment", methods=["POST"])
+def api_ai_comment():
+    import requests as req
+    body   = request.get_json(silent=True) or {}
+    prompt = body.get("prompt", "")
+    if not prompt:
+        return jsonify({"ok": False, "error": "prompt 필드 필요"}), 400
+    anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not anthropic_key:
+        return jsonify({"ok": False, "error": "ANTHROPIC_API_KEY 없음"}), 503
+    try:
+        res = req.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"Content-Type": "application/json",
+                     "x-api-key": anthropic_key,
+                     "anthropic-version": "2023-06-01"},
+            json={"model": "claude-sonnet-4-20250514", "max_tokens": 800,
+                  "messages": [{"role": "user", "content": prompt}]},
+            timeout=30,
+        )
+        data = res.json()
+        text = data.get("content", [{}])[0].get("text", "분석 결과 없음")
+        return jsonify({"ok": True, "text": text})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.route("/api/health")
 def api_health():
     return jsonify({
-        "ok":        True,
-        "time":      datetime.now().isoformat(),
-        "source":    DATA_SOURCE,
-        "kis_ready": KIS_AVAILABLE,
-        "cached":    len(_cache),
+        "ok":      True,
+        "time":    datetime.now().isoformat(),
+        "source":  DATA_SOURCE,
+        "cached":  len(_cache),
     })
-
 
 @app.route("/")
 def root():
-    return jsonify({"service": "TREND TRACKER API", "version": "2.0",
-                    "source": DATA_SOURCE, "kis": KIS_AVAILABLE})
-
+    return jsonify({"service": "TREND TRACKER API", "version": "3.0", "source": DATA_SOURCE})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5001))
     print("=" * 50)
-    print("  TREND TRACKER API (KIS 버전)")
+    print("  TREND TRACKER API (pykrx 버전)")
     print("  소스:", DATA_SOURCE)
     print("  http://0.0.0.0:%d" % port)
     print("=" * 50)
