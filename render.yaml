@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: trend-tracker-api
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn server:app --bind 0.0.0.0:$PORT --workers 1 --timeout 120
+    healthCheckPath: /api/health
+    envVars:
+      - key: KIS_APP_KEY
+        sync: false
+      - key: KIS_APP_SECRET
+        sync: false
+      - key: KIS_IS_PAPER
+        value: "false"
+      - key: ANTHROPIC_API_KEY
+        sync: false
