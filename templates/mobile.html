@@ -151,33 +151,87 @@ body {
 <script>
 (function() {
   const API = location.origin;
-  const socket = io(API, { transports: ['polling', 'websocket'] });
   const stocks = {};
   let currentFilter = 'ALL';
+  let useSocket = true;
+  let socket = null;
+  let fallbackTimer = null;
 
-  // --- Connection ---
   const statusEl = document.getElementById('connStatus');
-  socket.on('connect', () => {
-    statusEl.textContent = '실시간';
-    statusEl.className = 'status connected';
-    socket.emit('subscribe_all');
-  });
-  socket.on('disconnect', () => {
-    statusEl.textContent = '연결 끊김';
-    statusEl.className = 'status disconnected';
-  });
-  socket.on('connect_error', () => {
-    statusEl.textContent = '재연결 중...';
-    statusEl.className = 'status connecting';
-  });
+
+  // --- REST API 폴백 ---
+  function fetchViaREST() {
+    fetch(API + '/api/stocks')
+      .then(r => r.json())
+      .then(res => {
+        if (res.ok && res.data) {
+          res.data.forEach(s => { stocks[s.ticker] = s; });
+          renderCards();
+          statusEl.textContent = 'API';
+          statusEl.className = 'status connected';
+          document.getElementById('updatedBar').textContent = '갱신: ' + res.updated;
+        }
+      })
+      .catch(e => {
+        statusEl.textContent = '오류';
+        statusEl.className = 'status disconnected';
+      });
+  }
+
+  // --- Socket.IO 연결 시도 (5초 후 실패 시 REST 폴백) ---
+  try {
+    socket = io(API, {
+      transports: ['polling', 'websocket'],
+      reconnectionAttempts: 3,
+      timeout: 5000
+    });
+
+    // 5초 내 연결 안 되면 REST 폴백
+    fallbackTimer = setTimeout(() => {
+      if (!socket.connected) {
+        console.log('Socket.IO timeout, falling back to REST API');
+        useSocket = false;
+        fetchViaREST();
+        // REST 폴링 시작 (60초 간격)
+        setInterval(fetchViaREST, 60000);
+      }
+    }, 5000);
+
+    socket.on('connect', () => {
+      clearTimeout(fallbackTimer);
+      useSocket = true;
+      statusEl.textContent = '실시간';
+      statusEl.className = 'status connected';
+      socket.emit('subscribe_all');
+    });
+    socket.on('disconnect', () => {
+      statusEl.textContent = '연결 끊김';
+      statusEl.className = 'status disconnected';
+    });
+    socket.on('connect_error', (err) => {
+      console.log('Socket.IO error:', err.message);
+      statusEl.textContent = '재연결 중...';
+      statusEl.className = 'status connecting';
+    });
+  } catch(e) {
+    // Socket.IO 로드 실패 시 REST 폴백
+    useSocket = false;
+    fetchViaREST();
+    setInterval(fetchViaREST, 60000);
+  }
 
   // --- Buttons ---
   document.getElementById('btnSubscribeAll').addEventListener('click', () => {
-    socket.emit('subscribe_all');
+    if (socket && socket.connected) socket.emit('subscribe_all');
+    else fetchViaREST();
   });
   document.getElementById('btnRefresh').addEventListener('click', () => {
-    socket.emit('request_refresh');
     document.getElementById('btnRefresh').textContent = '로딩...';
+    if (socket && socket.connected) {
+      socket.emit('request_refresh');
+    } else {
+      fetchViaREST();
+    }
     setTimeout(() => { document.getElementById('btnRefresh').textContent = '새로고침'; }, 2000);
   });
 
@@ -191,22 +245,23 @@ body {
     });
   });
 
-  // --- Stock Updates ---
-  socket.on('stock_update', (data) => {
-    stocks[data.ticker] = data;
-    renderCards();
-    flashCard(data.ticker);
-  });
+  // --- Socket Stock Updates ---
+  if (socket) {
+    socket.on('stock_update', (data) => {
+      stocks[data.ticker] = data;
+      renderCards();
+      flashCard(data.ticker);
+    });
 
-  socket.on('refresh_complete', (data) => {
-    document.getElementById('updatedBar').textContent = '갱신: ' + data.at;
-  });
+    socket.on('refresh_complete', (data) => {
+      document.getElementById('updatedBar').textContent = '갱신: ' + data.at;
+    });
 
-  // --- Signal Alerts ---
-  socket.on('signal_change', (alert) => {
-    showAlert(alert);
-    if ('vibrate' in navigator) navigator.vibrate(200);
-  });
+    socket.on('signal_change', (alert) => {
+      showAlert(alert);
+      if ('vibrate' in navigator) navigator.vibrate(200);
+    });
+  }
 
   function showAlert(alert) {
     const el = document.createElement('div');
