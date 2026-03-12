@@ -20,7 +20,7 @@ from flask import Flask, jsonify, request, Response, render_template
 from flask_socketio import SocketIO, emit, join_room, leave_room
 
 app = Flask(__name__)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
+socketio = SocketIO(app, cors_allowed_origins="*")
 
 @app.after_request
 def add_cors(response):
@@ -511,6 +511,27 @@ def _realtime_broadcast():
 
             except Exception as e:
                 print("  [RT ERROR] %s: %s" % (ticker, str(e)[:80]))
+
+
+# gunicorn은 if __name__ 블록을 실행하지 않으므로
+# 모듈 레벨에서 백그라운드 태스크를 시작해야 함
+_rt_started = False
+_rt_lock = threading.Lock()
+
+def ensure_realtime_started():
+    """백그라운드 브로드캐스트 태스크가 한 번만 시작되도록 보장"""
+    global _rt_started
+    with _rt_lock:
+        if _rt_started:
+            return
+        _rt_started = True
+    socketio.start_background_task(_realtime_broadcast)
+    print("  [RT] 백그라운드 브로드캐스트 시작됨")
+
+@socketio.on("connect")
+def _ensure_rt_on_first_connect():
+    """첫 연결 시 백그라운드 태스크 보장 (eventlet 컨텍스트 안에서 시작)"""
+    ensure_realtime_started()
 
 
 if __name__ == "__main__":
