@@ -305,15 +305,80 @@ def api_stocks():
         "source":  DATA_SOURCE,
     })
 
+# ── 전체 종목 목록 캐시 (코스피+코스닥) ──
+_all_stocks_cache = {"data": None, "ts": None}
+_all_stocks_lock = threading.Lock()
+
+def _get_all_stocks():
+    """pykrx로 코스피+코스닥 전체 종목 목록 가져오기 (캐시 24h)"""
+    with _all_stocks_lock:
+        if _all_stocks_cache["data"] and _all_stocks_cache["ts"]:
+            if (datetime.now() - _all_stocks_cache["ts"]).total_seconds() < 86400:
+                return _all_stocks_cache["data"]
+    if not PYKRX_AVAILABLE:
+        return {t: n for t, n in DEFAULT_STOCKS.items()}
+    try:
+        from pykrx import stock as krx
+        today = date.today().strftime("%Y%m%d")
+        result = {}
+        for ticker in krx.get_market_ticker_list(today, market="KOSPI"):
+            name = krx.get_market_ticker_name(ticker)
+            if name:
+                result[ticker] = name
+        for ticker in krx.get_market_ticker_list(today, market="KOSDAQ"):
+            name = krx.get_market_ticker_name(ticker)
+            if name:
+                result[ticker] = name
+        with _all_stocks_lock:
+            _all_stocks_cache["data"] = result
+            _all_stocks_cache["ts"] = datetime.now()
+        print("  [종목목록] 총 %d개 로드" % len(result))
+        return result
+    except Exception as e:
+        print("  [종목목록 ERROR]", e)
+        return {t: n for t, n in DEFAULT_STOCKS.items()}
+
+@app.route("/api/search")
+def api_search():
+    """종목 검색 (이름 또는 코드). ?q=삼성 또는 ?q=005930"""
+    q = request.args.get("q", "").strip()
+    if not q or len(q) < 1:
+        return jsonify({"ok": False, "error": "검색어 필요"}), 400
+    all_stocks = _get_all_stocks()
+    results = []
+    for ticker, name in all_stocks.items():
+        if q in name or q in ticker:
+            results.append({"ticker": ticker, "name": name})
+            if len(results) >= 30:
+                break
+    return jsonify({"ok": True, "results": results, "total": len(results)})
+
+@app.route("/api/analyze/<ticker>")
+def api_analyze(ticker):
+    """임의 종목 분석 (DEFAULT_STOCKS에 없는 종목도 가능)"""
+    all_stocks = _get_all_stocks()
+    name = all_stocks.get(ticker) or DEFAULT_STOCKS.get(ticker)
+    if not name:
+        return jsonify({"ok": False, "error": "종목코드 없음: " + ticker}), 404
+    try:
+        rows = fetch_ohlcv(ticker, 36)
+        rows = analyze(rows)
+        summary = _build_stock_summary(ticker, name, rows)
+        return jsonify({"ok": True, **summary})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 @app.route("/api/stock/<ticker>")
 def api_stock(ticker):
-    if ticker not in DEFAULT_STOCKS:
+    all_stocks = _get_all_stocks()
+    name = all_stocks.get(ticker) or DEFAULT_STOCKS.get(ticker)
+    if not name:
         return jsonify({"ok": False, "error": "종목 없음"}), 404
     rows = get_stock_data(ticker)
     return jsonify({
         "ok":     True,
         "ticker": ticker,
-        "name":   DEFAULT_STOCKS[ticker],
+        "name":   name,
         "data":   rows,
         "source": DATA_SOURCE,
     })
