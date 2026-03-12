@@ -16,7 +16,7 @@ import threading
 import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, date
-from flask import Flask, jsonify, request, Response
+from flask import Flask, jsonify, request, Response, render_template
 from flask_socketio import SocketIO, emit, join_room, leave_room
 
 app = Flask(__name__)
@@ -313,6 +313,11 @@ def api_health():
         "pykrx":  PYKRX_AVAILABLE,
         "cached": len(_cache),
     })
+
+@app.route("/m")
+def mobile():
+    """모바일 실시간 대시보드"""
+    return render_template("mobile.html")
 
 @app.route("/")
 def root():
