@@ -20,7 +20,8 @@ from flask import Flask, jsonify, request, Response, render_template
 from flask_socketio import SocketIO, emit, join_room, leave_room
 
 app = Flask(__name__)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet",
+                    ping_timeout=60, ping_interval=25)
 
 @app.after_request
 def add_cors(response):
