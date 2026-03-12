@@ -151,7 +151,7 @@ body {
 <script>
 (function() {
   const API = location.origin;
-  const socket = io(API, { transports: ['websocket', 'polling'] });
+  const socket = io(API, { transports: ['polling', 'websocket'] });
   const stocks = {};
   let currentFilter = 'ALL';
 

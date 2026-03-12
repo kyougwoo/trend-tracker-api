@@ -20,7 +20,7 @@ from flask import Flask, jsonify, request, Response, render_template
 from flask_socketio import SocketIO, emit, join_room, leave_room
 
 app = Flask(__name__)
-socketio = SocketIO(app, cors_allowed_origins="*")
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
 
 @app.after_request
 def add_cors(response):
@@ -369,6 +369,7 @@ def handle_connect():
     with _subs_lock:
         _subscriptions[sid] = set()
     print("  [WS] 연결: %s" % sid)
+    ensure_realtime_started()
     emit("connected", {"sid": sid, "message": "실시간 연결 성공"})
 
 
@@ -528,10 +529,6 @@ def ensure_realtime_started():
     socketio.start_background_task(_realtime_broadcast)
     print("  [RT] 백그라운드 브로드캐스트 시작됨")
 
-@socketio.on("connect")
-def _ensure_rt_on_first_connect():
-    """첫 연결 시 백그라운드 태스크 보장 (eventlet 컨텍스트 안에서 시작)"""
-    ensure_realtime_started()
 
 
 if __name__ == "__main__":
