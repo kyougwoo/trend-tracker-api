@@ -16,7 +16,7 @@ import threading
 import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, date
-from flask import Flask, jsonify, request, Response, render_template
+from flask import Flask, jsonify, request, Response, render_template, send_from_directory
 from flask_socketio import SocketIO, emit, join_room, leave_room
 
 app = Flask(__name__)
@@ -52,54 +52,43 @@ PYKRX_AVAILABLE = _check_pykrx()
 DATA_SOURCE = "pykrx" if PYKRX_AVAILABLE else "sample"
 print("  데이터 소스:", DATA_SOURCE)
 
-DEFAULT_STOCKS = {
-    # 반도체
-    "005930": "삼성전자",
-    "000660": "SK하이닉스",
-    # IT/플랫폼
-    "035420": "NAVER",
-    "035720": "카카오",
-    # 바이오/헬스케어
-    "068270": "셀트리온",
-    "207940": "삼성바이오로직스",
-    "000100": "유한양행",
-    # 2차전지/소재
-    "051910": "LG화학",
-    "006400": "삼성SDI",
-    "373220": "LG에너지솔루션",
-    "247540": "에코프로비엠",
-    # 자동차
-    "005380": "현대차",
-    "000270": "기아",
-    "012330": "현대모비스",
-    # 금융
-    "105560": "KB금융",
-    "055550": "신한지주",
-    "086790": "하나금융지주",
-    # 철강/에너지
-    "005490": "POSCO홀딩스",
-    "015760": "한국전력",
-    # 전자/가전
-    "066570": "LG전자",
-    # 방산/조선
-    "012450": "한화에어로스페이스",
-    "009540": "HD한국조선해양",
-    "042660": "한화오션",
-    # AI
-    "042700": "한미반도체",
-    "007660": "이수페타시스",
-    "017670": "SK텔레콤",
-    "328130": "루닛",
-    # 원전
-    "034020": "두산에너빌리티",
-    "052690": "한전기술",
-    "051600": "한전KPS",
-    # 우주
-    "047810": "한국항공우주",
-    "099320": "쎄트렉아이",
-    "462350": "이노스페이스",
-    "189300": "인텔리안테크",
+# 섹터 정보
+SECTORS = {
+    "반도체": ["005930", "000660"],
+    "IT/플랫폼": ["035420", "035720"],
+    "바이오": ["068270", "207940", "000100"],
+    "2차전지": ["051910", "006400", "373220", "247540"],
+    "자동차": ["005380", "000270", "012330"],
+    "금융": ["105560", "055550", "086790"],
+    "철강/에너지": ["005490", "015760"],
+    "전자": ["066570"],
+    "방산/조선": ["012450", "009540", "042660"],
+    "AI": ["042700", "007660", "017670", "328130"],
+    "원전": ["034020", "052690", "051600"],
+    "우주": ["047810", "099320", "462350", "189300"],
 }
+
+# 종목코드 → 이름
+DEFAULT_STOCKS = {
+    "005930": "삼성전자", "000660": "SK하이닉스",
+    "035420": "NAVER", "035720": "카카오",
+    "068270": "셀트리온", "207940": "삼성바이오로직스", "000100": "유한양행",
+    "051910": "LG화학", "006400": "삼성SDI", "373220": "LG에너지솔루션", "247540": "에코프로비엠",
+    "005380": "현대차", "000270": "기아", "012330": "현대모비스",
+    "105560": "KB금융", "055550": "신한지주", "086790": "하나금융지주",
+    "005490": "POSCO홀딩스", "015760": "한국전력",
+    "066570": "LG전자",
+    "012450": "한화에어로스페이스", "009540": "HD한국조선해양", "042660": "한화오션",
+    "042700": "한미반도체", "007660": "이수페타시스", "017670": "SK텔레콤", "328130": "루닛",
+    "034020": "두산에너빌리티", "052690": "한전기술", "051600": "한전KPS",
+    "047810": "한국항공우주", "099320": "쎄트렉아이", "462350": "이노스페이스", "189300": "인텔리안테크",
+}
+
+# 종목코드 → 섹터 역매핑
+TICKER_SECTOR = {}
+for sect, tickers in SECTORS.items():
+    for t in tickers:
+        TICKER_SECTOR[t] = sect
 
 _cache      = {}
 _cache_lock = threading.Lock()
@@ -189,13 +178,77 @@ def fetch_ohlcv(ticker, months=36):
 def rolling_mean(arr, n, i):
     return sum(arr[i-n+1:i+1]) / n if i >= n - 1 else None
 
+def calc_rsi(closes, period=14):
+    """RSI 계산. 리스트 길이 = closes 길이, 초기값은 None"""
+    rsi = [None] * len(closes)
+    if len(closes) < period + 1:
+        return rsi
+    gains, losses = [], []
+    for j in range(1, period + 1):
+        diff = closes[j] - closes[j - 1]
+        gains.append(max(diff, 0))
+        losses.append(max(-diff, 0))
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
+    rsi[period] = 100 - (100 / (1 + avg_gain / avg_loss)) if avg_loss != 0 else 100
+    for j in range(period + 1, len(closes)):
+        diff = closes[j] - closes[j - 1]
+        avg_gain = (avg_gain * (period - 1) + max(diff, 0)) / period
+        avg_loss = (avg_loss * (period - 1) + max(-diff, 0)) / period
+        rsi[j] = 100 - (100 / (1 + avg_gain / avg_loss)) if avg_loss != 0 else 100
+    return rsi
+
+def calc_ema(arr, period):
+    """EMA 계산"""
+    ema = [None] * len(arr)
+    if len(arr) < period:
+        return ema
+    ema[period - 1] = sum(arr[:period]) / period
+    k = 2 / (period + 1)
+    for j in range(period, len(arr)):
+        ema[j] = arr[j] * k + ema[j - 1] * (1 - k)
+    return ema
+
+def calc_macd(closes):
+    """MACD (12,26,9) 계산. 리턴: (macd_line, signal_line, histogram)"""
+    n = len(closes)
+    macd_line = [None] * n
+    signal_line = [None] * n
+    histogram = [None] * n
+    ema12 = calc_ema(closes, 12)
+    ema26 = calc_ema(closes, 26)
+    macd_vals = []
+    for j in range(n):
+        if ema12[j] is not None and ema26[j] is not None:
+            macd_line[j] = round(ema12[j] - ema26[j])
+            macd_vals.append(macd_line[j])
+        else:
+            macd_vals.append(0)
+    # signal = EMA9 of macd_line (유효값만)
+    valid_start = next((j for j in range(n) if macd_line[j] is not None), n)
+    if valid_start < n:
+        valid_macd = [macd_line[j] if macd_line[j] is not None else 0 for j in range(n)]
+        sig = calc_ema(valid_macd, 9)
+        for j in range(n):
+            if sig[j] is not None and macd_line[j] is not None:
+                signal_line[j] = round(sig[j])
+                histogram[j] = macd_line[j] - signal_line[j]
+    return macd_line, signal_line, histogram
+
 def analyze(rows):
     closes = [r["close"] for r in rows]
     avgvol = sum(r["volume"] for r in rows) / max(len(rows), 1)
+    # RSI & MACD
+    rsi_vals = calc_rsi(closes, 14)
+    macd_line, macd_signal, macd_hist = calc_macd(closes)
     for i, row in enumerate(rows):
         row["ma5"]  = round(rolling_mean(closes, 5,  i)) if i >= 4  else None
         row["ma10"] = round(rolling_mean(closes, 10, i)) if i >= 9  else None
         row["ma20"] = round(rolling_mean(closes, 20, i)) if i >= 19 else None
+        row["rsi"] = round(rsi_vals[i], 1) if rsi_vals[i] is not None else None
+        row["macd"] = macd_line[i]
+        row["macdSignal"] = macd_signal[i]
+        row["macdHist"] = macd_hist[i]
         row["volStrong"] = row["volume"] > avgvol * 1.2
         ma5, ma10, ma20 = row["ma5"], row["ma10"], row["ma20"]
         if not (ma5 and ma10 and ma20):
@@ -234,25 +287,7 @@ def api_stocks():
     def _fetch(item):
         ticker, name = item
         rows   = get_stock_data(ticker)
-        latest = rows[-1]
-        prev   = rows[-2] if len(rows) >= 2 else latest
-        return {
-            "ticker":     ticker,
-            "name":       name,
-            "date":       latest["date"],
-            "close":      latest["close"],
-            "prev":       prev["close"],
-            "change":     latest["close"] - prev["close"],
-            "change_pct": round((latest["close"]-prev["close"]) / max(prev["close"],1) * 100, 2),
-            "ma5":        latest["ma5"],
-            "ma10":       latest["ma10"],
-            "ma20":       latest["ma20"],
-            "alignment":  latest["alignment"],
-            "forking":    latest["forking"],
-            "signal":     latest["signal"],
-            "volStrong":  latest.get("volStrong", False),
-            "source":     DATA_SOURCE,
-        }
+        return _build_stock_summary(ticker, name, rows)
     result = []
     with ThreadPoolExecutor(max_workers=8) as ex:
         futures = {ex.submit(_fetch, item): item for item in DEFAULT_STOCKS.items()}
@@ -343,6 +378,94 @@ def api_ai_comment():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
+# ── 섹터 목록 API ──
+@app.route("/api/sectors")
+def api_sectors():
+    return jsonify({"ok": True, "sectors": SECTORS})
+
+# ── 시그널 히스토리 API ──
+@app.route("/api/signal-history/<ticker>")
+def api_signal_history(ticker):
+    if ticker not in DEFAULT_STOCKS:
+        return jsonify({"ok": False, "error": "종목 없음"}), 404
+    rows = get_stock_data(ticker)
+    history = []
+    prev_signal = None
+    for r in rows:
+        sig = r.get("signal", "--")
+        if sig != "--" and sig != prev_signal:
+            history.append({"date": r["date"], "signal": sig, "close": r["close"],
+                            "rsi": r.get("rsi"), "macd": r.get("macd")})
+            prev_signal = sig
+    return jsonify({"ok": True, "ticker": ticker, "name": DEFAULT_STOCKS[ticker],
+                    "history": history})
+
+# ── AI 종합 코멘트 (전체 시장 요약) ──
+@app.route("/api/ai-summary", methods=["POST"])
+def api_ai_summary():
+    import requests as req
+    anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not anthropic_key:
+        return jsonify({"ok": False, "error": "ANTHROPIC_API_KEY 없음"}), 503
+    # 현재 종목 데이터 수집
+    summaries = []
+    for ticker, name in DEFAULT_STOCKS.items():
+        try:
+            rows = get_stock_data(ticker)
+            latest = rows[-1]
+            summaries.append("%s(%s): %s원, 시그널=%s, RSI=%s, MACD=%s, %s" % (
+                name, ticker, latest["close"], latest.get("signal","--"),
+                latest.get("rsi","N/A"), latest.get("macd","N/A"),
+                latest.get("alignment","--")))
+        except Exception:
+            pass
+    prompt = ("당신은 한국 주식 시장 분석 전문가입니다. "
+              "아래 33개 종목의 최신 데이터를 분석하여 "
+              "1) 시장 전체 요약 (2~3줄) "
+              "2) 섹터별 핵심 포인트 (각 1줄) "
+              "3) 주목할 종목 TOP 3 (이유 포함) "
+              "을 한국어로 간결하게 작성해주세요.\n\n" + "\n".join(summaries))
+    try:
+        res = req.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"Content-Type": "application/json",
+                     "x-api-key": anthropic_key,
+                     "anthropic-version": "2023-06-01"},
+            json={"model": "claude-sonnet-4-20250514", "max_tokens": 1200,
+                  "messages": [{"role": "user", "content": prompt}]},
+            timeout=45,
+        )
+        data = res.json()
+        text = data.get("content", [{}])[0].get("text", "분석 결과 없음")
+        return jsonify({"ok": True, "text": text,
+                        "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+# ── SMS 알림 설정 (Twilio 기반) ──
+SMS_PHONE = os.environ.get("SMS_PHONE", "")  # 수신 전화번호 (+821012345678)
+TWILIO_SID = os.environ.get("TWILIO_SID", "")
+TWILIO_TOKEN = os.environ.get("TWILIO_TOKEN", "")
+TWILIO_FROM = os.environ.get("TWILIO_FROM", "")  # Twilio 발신번호
+
+def send_sms(message):
+    """Twilio를 통한 SMS 발송"""
+    if not all([SMS_PHONE, TWILIO_SID, TWILIO_TOKEN, TWILIO_FROM]):
+        return False
+    try:
+        import requests as req
+        res = req.post(
+            "https://api.twilio.com/2010-04-01/Accounts/%s/Messages.json" % TWILIO_SID,
+            auth=(TWILIO_SID, TWILIO_TOKEN),
+            data={"To": SMS_PHONE, "From": TWILIO_FROM, "Body": message},
+            timeout=10,
+        )
+        print("  [SMS] 발송: %s (status=%d)" % (message[:30], res.status_code))
+        return res.status_code == 201
+    except Exception as e:
+        print("  [SMS ERROR]", e)
+        return False
+
 @app.route("/api/health")
 def api_health():
     return jsonify({
@@ -357,6 +480,14 @@ def api_health():
 def mobile():
     """모바일 실시간 대시보드"""
     return render_template("mobile.html")
+
+@app.route("/manifest.json")
+def manifest():
+    return send_from_directory("static", "manifest.json", mimetype="application/manifest+json")
+
+@app.route("/sw.js")
+def service_worker():
+    return send_from_directory("static", "sw.js", mimetype="application/javascript")
 
 @app.route("/")
 def root():
@@ -382,9 +513,12 @@ def _build_stock_summary(ticker, name, rows):
     """종목 데이터를 클라이언트 전송용 요약 dict로 변환"""
     latest = rows[-1]
     prev = rows[-2] if len(rows) >= 2 else latest
+    # 최근 12개월 종가 스파크라인
+    sparkline = [r["close"] for r in rows[-12:]]
     return {
         "ticker":     ticker,
         "name":       name,
+        "sector":     TICKER_SECTOR.get(ticker, "기타"),
         "date":       latest["date"],
         "close":      latest["close"],
         "prev":       prev["close"],
@@ -393,10 +527,15 @@ def _build_stock_summary(ticker, name, rows):
         "ma5":        latest["ma5"],
         "ma10":       latest["ma10"],
         "ma20":       latest["ma20"],
+        "rsi":        latest.get("rsi"),
+        "macd":       latest.get("macd"),
+        "macdSignal": latest.get("macdSignal"),
+        "macdHist":   latest.get("macdHist"),
         "alignment":  latest["alignment"],
         "forking":    latest["forking"],
         "signal":     latest["signal"],
         "volStrong":  latest.get("volStrong", False),
+        "sparkline":  sparkline,
         "source":     DATA_SOURCE,
         "updated":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
@@ -551,6 +690,9 @@ def _realtime_broadcast():
                     }
                     socketio.emit("signal_change", alert, room="stock:" + ticker)
                     print("  [RT] 시그널 변경: %s %s → %s" % (ticker, old_signal, new_signal))
+                    # SMS 알림
+                    send_sms("[Trend Tracker] %s %s→%s (%s원)" % (
+                        DEFAULT_STOCKS[ticker], old_signal, new_signal, summary["close"]))
 
                 _last_signals[ticker] = new_signal
 

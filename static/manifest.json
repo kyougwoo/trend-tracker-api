@@ -1,0 +1,21 @@
+{
+  "name": "Trend Tracker",
+  "short_name": "TrendTracker",
+  "description": "실시간 한국 주식 추세 분석",
+  "start_url": "/m",
+  "display": "standalone",
+  "background_color": "#0d1117",
+  "theme_color": "#0d1117",
+  "icons": [
+    {
+      "src": "/static/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "/static/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}
