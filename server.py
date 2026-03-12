@@ -239,7 +239,7 @@ def api_stocks():
             "source":     DATA_SOURCE,
         }
     result = []
-    with ThreadPoolExecutor(max_workers=4) as ex:
+    with ThreadPoolExecutor(max_workers=8) as ex:
         futures = {ex.submit(_fetch, item): item for item in DEFAULT_STOCKS.items()}
         for fut in as_completed(futures):
             try:
@@ -424,14 +424,19 @@ def handle_subscribe(data):
     print("  [WS] 구독 (%s): %s" % (sid[:8], added))
     emit("subscribed", {"tickers": added})
 
-    # 구독 즉시 최신 데이터 전송
-    for t in added:
-        try:
-            rows = get_stock_data(t)
-            summary = _build_stock_summary(t, DEFAULT_STOCKS[t], rows)
-            emit("stock_update", summary)
-        except Exception as e:
-            emit("error", {"ticker": t, "message": str(e)})
+    # 구독 즉시 최신 데이터 병렬 로딩 후 전송
+    def _load(t):
+        rows = get_stock_data(t)
+        return _build_stock_summary(t, DEFAULT_STOCKS[t], rows)
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futures = {ex.submit(_load, t): t for t in added}
+        for fut in as_completed(futures):
+            t = futures[fut]
+            try:
+                emit("stock_update", fut.result())
+            except Exception as e:
+                emit("error", {"ticker": t, "message": str(e)})
 
 
 @socketio.on("unsubscribe")
