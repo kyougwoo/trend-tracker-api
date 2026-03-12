@@ -442,29 +442,6 @@ def api_ai_summary():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
-# ── SMS 알림 설정 (Twilio 기반) ──
-SMS_PHONE = os.environ.get("SMS_PHONE", "")  # 수신 전화번호 (+821012345678)
-TWILIO_SID = os.environ.get("TWILIO_SID", "")
-TWILIO_TOKEN = os.environ.get("TWILIO_TOKEN", "")
-TWILIO_FROM = os.environ.get("TWILIO_FROM", "")  # Twilio 발신번호
-
-def send_sms(message):
-    """Twilio를 통한 SMS 발송"""
-    if not all([SMS_PHONE, TWILIO_SID, TWILIO_TOKEN, TWILIO_FROM]):
-        return False
-    try:
-        import requests as req
-        res = req.post(
-            "https://api.twilio.com/2010-04-01/Accounts/%s/Messages.json" % TWILIO_SID,
-            auth=(TWILIO_SID, TWILIO_TOKEN),
-            data={"To": SMS_PHONE, "From": TWILIO_FROM, "Body": message},
-            timeout=10,
-        )
-        print("  [SMS] 발송: %s (status=%d)" % (message[:30], res.status_code))
-        return res.status_code == 201
-    except Exception as e:
-        print("  [SMS ERROR]", e)
-        return False
 
 @app.route("/api/health")
 def api_health():
@@ -690,9 +667,6 @@ def _realtime_broadcast():
                     }
                     socketio.emit("signal_change", alert, room="stock:" + ticker)
                     print("  [RT] 시그널 변경: %s %s → %s" % (ticker, old_signal, new_signal))
-                    # SMS 알림
-                    send_sms("[Trend Tracker] %s %s→%s (%s원)" % (
-                        DEFAULT_STOCKS[ticker], old_signal, new_signal, summary["close"]))
 
                 _last_signals[ticker] = new_signal
 
