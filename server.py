@@ -53,14 +53,52 @@ DATA_SOURCE = "pykrx" if PYKRX_AVAILABLE else "sample"
 print("  데이터 소스:", DATA_SOURCE)
 
 DEFAULT_STOCKS = {
+    # 반도체
     "005930": "삼성전자",
     "000660": "SK하이닉스",
+    # IT/플랫폼
     "035420": "NAVER",
-    "051910": "LG화학",
-    "005380": "현대차",
-    "068270": "셀트리온",
     "035720": "카카오",
+    # 바이오/헬스케어
+    "068270": "셀트리온",
     "207940": "삼성바이오로직스",
+    "000100": "유한양행",
+    # 2차전지/소재
+    "051910": "LG화학",
+    "006400": "삼성SDI",
+    "373220": "LG에너지솔루션",
+    "247540": "에코프로비엠",
+    # 자동차
+    "005380": "현대차",
+    "000270": "기아",
+    "012330": "현대모비스",
+    # 금융
+    "105560": "KB금융",
+    "055550": "신한지주",
+    "086790": "하나금융지주",
+    # 철강/에너지
+    "005490": "POSCO홀딩스",
+    "015760": "한국전력",
+    # 전자/가전
+    "066570": "LG전자",
+    # 방산/조선
+    "012450": "한화에어로스페이스",
+    "009540": "HD한국조선해양",
+    "042660": "한화오션",
+    # AI
+    "042700": "한미반도체",
+    "007660": "이수페타시스",
+    "017670": "SK텔레콤",
+    "328130": "루닛",
+    # 원전
+    "034020": "두산에너빌리티",
+    "052690": "한전기술",
+    "051600": "한전KPS",
+    # 우주
+    "047810": "한국항공우주",
+    "099320": "쎄트렉아이",
+    "462350": "이노스페이스",
+    "189300": "인텔리안테크",
 }
 
 _cache      = {}
@@ -216,7 +254,7 @@ def api_stocks():
             "source":     DATA_SOURCE,
         }
     result = []
-    with ThreadPoolExecutor(max_workers=4) as ex:
+    with ThreadPoolExecutor(max_workers=8) as ex:
         futures = {ex.submit(_fetch, item): item for item in DEFAULT_STOCKS.items()}
         for fut in as_completed(futures):
             try:
@@ -401,14 +439,19 @@ def handle_subscribe(data):
     print("  [WS] 구독 (%s): %s" % (sid[:8], added))
     emit("subscribed", {"tickers": added})
 
-    # 구독 즉시 최신 데이터 전송
-    for t in added:
-        try:
-            rows = get_stock_data(t)
-            summary = _build_stock_summary(t, DEFAULT_STOCKS[t], rows)
-            emit("stock_update", summary)
-        except Exception as e:
-            emit("error", {"ticker": t, "message": str(e)})
+    # 구독 즉시 최신 데이터 병렬 로딩 후 전송
+    def _load(t):
+        rows = get_stock_data(t)
+        return _build_stock_summary(t, DEFAULT_STOCKS[t], rows)
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futures = {ex.submit(_load, t): t for t in added}
+        for fut in as_completed(futures):
+            t = futures[fut]
+            try:
+                emit("stock_update", fut.result())
+            except Exception as e:
+                emit("error", {"ticker": t, "message": str(e)})
 
 
 @socketio.on("unsubscribe")
