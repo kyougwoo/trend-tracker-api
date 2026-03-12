@@ -310,7 +310,12 @@ _all_stocks_cache = {"data": None, "ts": None}
 _all_stocks_lock = threading.Lock()
 
 def _get_all_stocks():
-    """pykrx로 코스피+코스닥 전체 종목 목록 가져오기 (캐시 24h)"""
+    """pykrx로 코스피+코스닥 전체 종목 목록 가져오기 (캐시 24h)
+
+    핵심: get_market_ticker_name() 개별 호출 대신
+    get_market_cap_by_ticker()로 전종목 시가총액을 한번에 받아서
+    인덱스(종목코드)를 추출 → 이름만 별도 매핑
+    """
     with _all_stocks_lock:
         if _all_stocks_cache["data"] and _all_stocks_cache["ts"]:
             if (datetime.now() - _all_stocks_cache["ts"]).total_seconds() < 86400:
@@ -320,15 +325,25 @@ def _get_all_stocks():
     try:
         from pykrx import stock as krx
         today = date.today().strftime("%Y%m%d")
-        result = {}
-        for ticker in krx.get_market_ticker_list(today, market="KOSPI"):
-            name = krx.get_market_ticker_name(ticker)
-            if name:
-                result[ticker] = name
-        for ticker in krx.get_market_ticker_list(today, market="KOSDAQ"):
-            name = krx.get_market_ticker_name(ticker)
-            if name:
-                result[ticker] = name
+        result = dict(DEFAULT_STOCKS)  # 기본 종목은 항상 포함
+
+        for market in ["KOSPI", "KOSDAQ"]:
+            try:
+                # 한번의 호출로 전종목 티커 리스트 획득
+                tickers = krx.get_market_ticker_list(today, market=market)
+                # ThreadPool로 이름 조회 병렬화 (순차 대비 10배+ 빠름)
+                def _get_name(t):
+                    try:
+                        return (t, krx.get_market_ticker_name(t))
+                    except Exception:
+                        return (t, None)
+                with ThreadPoolExecutor(max_workers=16) as ex:
+                    for t, name in ex.map(_get_name, tickers):
+                        if name:
+                            result[t] = name
+            except Exception as e:
+                print("  [종목목록 %s ERROR] %s" % (market, e))
+
         with _all_stocks_lock:
             _all_stocks_cache["data"] = result
             _all_stocks_cache["ts"] = datetime.now()
@@ -338,31 +353,46 @@ def _get_all_stocks():
         print("  [종목목록 ERROR]", e)
         return {t: n for t, n in DEFAULT_STOCKS.items()}
 
+def _preload_all_stocks():
+    """서버 시작 시 백그라운드로 종목 목록 미리 로드"""
+    try:
+        stocks = _get_all_stocks()
+        print("  [프리로드] 종목 %d개 캐시 완료" % len(stocks))
+    except Exception as e:
+        print("  [프리로드 ERROR]", e)
+
+# 서버 시작 시 백그라운드 프리로드
+threading.Thread(target=_preload_all_stocks, daemon=True).start()
+
 @app.route("/api/search")
 def api_search():
     """종목 검색 (이름 또는 코드). ?q=삼성 또는 ?q=005930"""
     q = request.args.get("q", "").strip()
     if not q or len(q) < 1:
         return jsonify({"ok": False, "error": "검색어 필요"}), 400
-    all_stocks = _get_all_stocks()
+    # 캐시가 준비되어 있으면 전종목에서 검색, 아니면 DEFAULT_STOCKS에서 즉시 응답
+    with _all_stocks_lock:
+        cached = _all_stocks_cache.get("data")
+    all_stocks = cached if cached else DEFAULT_STOCKS
+    loading = cached is None
     results = []
     for ticker, name in all_stocks.items():
         if q in name or q in ticker:
             results.append({"ticker": ticker, "name": name})
             if len(results) >= 30:
                 break
-    return jsonify({"ok": True, "results": results, "total": len(results)})
+    return jsonify({"ok": True, "results": results, "total": len(results),
+                    "full_loaded": not loading})
 
 @app.route("/api/analyze/<ticker>")
 def api_analyze(ticker):
-    """임의 종목 분석 (DEFAULT_STOCKS에 없는 종목도 가능)"""
+    """임의 종목 분석 (DEFAULT_STOCKS에 없는 종목도 가능, 캐시 활용)"""
     all_stocks = _get_all_stocks()
     name = all_stocks.get(ticker) or DEFAULT_STOCKS.get(ticker)
     if not name:
         return jsonify({"ok": False, "error": "종목코드 없음: " + ticker}), 404
     try:
-        rows = fetch_ohlcv(ticker, 36)
-        rows = analyze(rows)
+        rows = get_stock_data(ticker)  # 캐시 활용
         summary = _build_stock_summary(ticker, name, rows)
         return jsonify({"ok": True, **summary})
     except Exception as e:

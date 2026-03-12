@@ -316,29 +316,34 @@ window.doSearch=function(q){
   clearTimeout(searchTimer);
   const box=document.getElementById('searchResults');
   if(!q||q.length<1){box.innerHTML='';return}
+  box.innerHTML='<div class="empty" style="padding:12px">검색 중...</div>';
   searchTimer=setTimeout(()=>{
-    fetch(API+'/api/search?q='+encodeURIComponent(q)).then(r=>r.json()).then(res=>{
-      if(!res.ok){box.innerHTML='';return}
-      box.innerHTML=res.results.map(r=>
-        '<div class="search-item">'+
-          '<div><div class="si-name">'+r.name+'</div><div class="si-code">'+r.ticker+'</div></div>'+
-          '<button class="si-btn" onclick="addWatch(\''+r.ticker+'\',\''+r.name+'\')">'+
-            (favs.includes(r.ticker)?'추가됨':'+ 추가')+'</button>'+
-        '</div>'
-      ).join('');
-    });
-  },300);
+    fetch(API+'/api/search?q='+encodeURIComponent(q),{signal:AbortSignal.timeout(15000)})
+      .then(r=>r.json()).then(res=>{
+        if(!res.ok||!res.results.length){box.innerHTML='<div class="empty" style="padding:12px">검색 결과 없음'+(res.full_loaded===false?' (전종목 로딩 중 — 잠시 후 재검색)':'')+'</div>';return}
+        const note=res.full_loaded===false?'<div style="padding:4px 12px;font-size:10px;color:var(--yellow)">전종목 로딩 중 — 기본 종목만 표시됩니다</div>':'';
+        box.innerHTML=note+res.results.map(r=>
+          '<div class="search-item">'+
+            '<div><div class="si-name">'+r.name+'</div><div class="si-code">'+r.ticker+'</div></div>'+
+            '<button class="si-btn" onclick="addWatch(\''+r.ticker+'\',\''+r.name+'\')">'+
+              (favs.includes(r.ticker)?'추가됨':'+ 추가')+'</button>'+
+          '</div>'
+        ).join('');
+      }).catch(()=>{box.innerHTML='<div class="empty" style="padding:12px">검색 실패 — 다시 시도해주세요</div>'});
+  },400);
 };
 
 window.addWatch=function(ticker,name){
   if(!favs.includes(ticker)){favs.push(ticker);saveFavs()}
-  // 분석 요청
+  // 바로 임시 데이터로 표시
+  if(!S[ticker])S[ticker]={ticker:ticker,name:name,signal:'--',close:0,change:0,change_pct:'0',alignment:'로딩중...',sparkline:[]};
+  renderWatch();
+  // 분석 요청 (백그라운드)
   fetch(API+'/api/analyze/'+ticker).then(r=>r.json()).then(res=>{
     if(res.ok){S[ticker]=res;renderWatch();renderCards()}
-  });
+  }).catch(()=>{});
   document.getElementById('searchInput').value='';
   document.getElementById('searchResults').innerHTML='';
-  renderWatch();
 };
 
 function renderWatch(){
